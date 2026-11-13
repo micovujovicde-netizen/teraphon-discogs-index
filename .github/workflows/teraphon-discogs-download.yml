@@ -1,0 +1,177 @@
+name: TERAPHON ONE MOVIE - DOWNLOAD (no R2 writes)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: teraphon-index-${{ github.run_id }}
+    steps:
+      - name: Prepare private draft release and TEST GitHub upload before indexing
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --draft \
+              --target "${GITHUB_SHA}" \
+              --title "TERAPHON Index - IN PROGRESS (${GITHUB_RUN_ID})" \
+              --notes "Unpublished draft. Do not use or upload until this workflow finishes green and COMPLETE.json is attached. No data is written to Cloudflare by this workflow."
+          fi
+          printf 'TERAPHON preflight run %s\n' "$GITHUB_RUN_ID" > PREFLIGHT.txt
+          if ! gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -qx PREFLIGHT.txt; then
+            gh release upload "$RELEASE_TAG" PREFLIGHT.txt
+          fi
+          mkdir -p check
+          gh release download "$RELEASE_TAG" --pattern PREFLIGHT.txt --dir check
+          cmp PREFLIGHT.txt check/PREFLIGHT.txt
+          gh release delete-asset "$RELEASE_TAG" PREFLIGHT.txt --yes
+          echo 'GitHub release upload and download: PASS. Safe to start 16 shards.'
+
+  build-shards:
+    needs: prepare-download
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    env:
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_REGION: auto
+      RCLONE_CONFIG_R2_ENDPOINT: https://c2bd2b5948d77f7a413a4ad97279fae4.r2.cloudflarestorage.com
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.TERAPHON_R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.TERAPHON_R2_SECRET_ACCESS_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: teraphon-index-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack original verified indexer
+        run: unzip -o -q TERAPHON_ONE_MOVIE_V2.zip 'one-movie/*'
+      - name: Install rclone and zstd
+        run: sudo apt-get update -qq && sudo apt-get install -y rclone zstd
+      - name: Run indexer unit tests
+        run: python3 -m unittest discover -s one-movie/tests -p 'test_*.py' -v
+      - name: Download originals from R2 (READ ONLY)
+        run: |
+          set -euo pipefail
+          test -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID"
+          test -n "$RCLONE_CONFIG_R2_SECRET_ACCESS_KEY"
+          mkdir -p input
+          rclone --config /dev/null copy r2:teraphon-music-data/raw/discogs-2026 input \
+            --include 'STATE.json' --include 'part_*.csv.gz' \
+            --transfers 8 --checkers 8 --retries 6
+      - name: Index assigned shard and compress (limit 362.5 MB/shard)
+        run: |
+          set -euo pipefail
+          python3 one-movie/index_shard.py --input-dir input --out-dir output \
+            --shard ${{ matrix.shard }} --shards 16 --max-bytes 362500000
+      - name: Deliver compressed shard to GitHub DOWNLOAD release (NOT R2)
+        run: |
+          set -euo pipefail
+          printf -v N '%02d' '${{ matrix.shard }}'
+          for FILE in "output/shard_${N}.jsonl.zst" "output/shard_${N}.json"; do
+            NAME="$(basename "$FILE")"
+            if gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -Fxq "$NAME"; then
+              echo "Found previously uploaded $NAME; verify bytes before reuse"
+              mkdir -p previous
+              gh release download "$RELEASE_TAG" --pattern "$NAME" --dir previous
+              cmp "$FILE" "previous/$NAME"
+            else
+              gh release upload "$RELEASE_TAG" "$FILE"
+            fi
+          done
+          echo "Shard ${N} safely available in GitHub draft release."
+
+  verify-and-package:
+    needs: [prepare-download, build-shards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: teraphon-index-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack finalizer
+        run: unzip -o -q TERAPHON_ONE_MOVIE_V2.zip 'one-movie/*'
+      - name: Fetch all 16 compressed parts and reports from GitHub
+        run: |
+          set -euo pipefail
+          mkdir -p verified reports
+          gh release download "$RELEASE_TAG" --pattern 'shard_*.jsonl.zst' --dir verified
+          gh release download "$RELEASE_TAG" --pattern 'shard_*.json' --dir reports
+          test "$(find verified -maxdepth 1 -name 'shard_*.jsonl.zst' | wc -l)" -eq 16
+          test "$(find reports -maxdepth 1 -name 'shard_*.json' | wc -l)" -eq 16
+      - name: Validate SHA-256, every observation, and 5.8 GB limit
+        run: |
+          set -euo pipefail
+          python3 one-movie/finalize.py --reports-dir reports --shards-dir verified \
+            --out-file COMPLETE.json --shards 16 --max-bytes 5800000000 \
+            --run-id "$GITHUB_RUN_ID"
+      - name: Make four easy-to-download TAR packages (each below 2 GiB)
+        run: |
+          set -euo pipefail
+          mkdir -p bundles package
+          for group in 0 1 2 3; do
+            rm -f package/*
+            cp COMPLETE.json package/COMPLETE.json
+            for offset in 0 1 2 3; do
+              shard=$((group * 4 + offset))
+              printf -v N '%02d' "$shard"
+              cp "verified/shard_${N}.jsonl.zst" package/
+              cp "reports/shard_${N}.json" package/
+            done
+            printf -v G '%02d' "$((group+1))"
+            tar -C package -cf "bundles/TERAPHON_INDEX_PART_${G}_of_04.tar" .
+            test "$(stat -c%s "bundles/TERAPHON_INDEX_PART_${G}_of_04.tar")" -lt 2147483648
+          done
+          (cd bundles && sha256sum TERAPHON_INDEX_PART_*.tar > SHA256SUMS.txt)
+          cp COMPLETE.json bundles/COMPLETE.json
+          ls -lh bundles/
+      - name: Upload verified download packages to GitHub draft Release
+        run: |
+          set -euo pipefail
+          for f in bundles/TERAPHON_INDEX_PART_*.tar bundles/SHA256SUMS.txt bundles/COMPLETE.json; do
+            gh release upload "$RELEASE_TAG" "$f"
+          done
+      - name: Re-download and verify all four packages (download integrity)
+        run: |
+          set -euo pipefail
+          mkdir -p download-check
+          gh release download "$RELEASE_TAG" --pattern 'TERAPHON_INDEX_PART_*.tar' --dir download-check
+          cp bundles/SHA256SUMS.txt download-check/
+          (cd download-check && sha256sum --check SHA256SUMS.txt)
+      - name: Mark READY, but keep draft PRIVATE until owner downloads
+        run: |
+          set -euo pipefail
+          cat > RELEASE_NOTES.md <<EOF
+          COMPLETE, SHA-256 VERIFIED. Run ${GITHUB_RUN_ID}.
+
+          Download all FOUR TERAPHON_INDEX_PART_0*_of_04.tar files below.
+          Also save COMPLETE.json and SHA256SUMS.txt.
+          Each TAR contains four compressed .jsonl.zst shards, their reports, and COMPLETE.json.
+          Extract all four TAR files into the same empty directory; do not upload TARs
+          as the final per-shard Cloudflare index until extraction and verification.
+
+          This release is an UNPUBLISHED DRAFT: only authorized repository collaborators
+          can download. The original Cloudflare R2 dataset has NOT been deleted/modified.
+          EOF
+          gh release edit "$RELEASE_TAG" --title "TERAPHON INDEX READY - DOWNLOAD 4 PARTS (${GITHUB_RUN_ID})" \
+            --notes-file RELEASE_NOTES.md
+          echo "READY: https://github.com/${GH_REPO}/releases"
