@@ -1,33 +1,47 @@
 name: TERAPHON Discogs safe pilot
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   pilot:
     runs-on: ubuntu-latest
     timeout-minutes: 50
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Unpack indexer
         run: unzip -o -q TERAPHON_DISCOGS_INDEX_PILOT_V1.zip 'teraphon-indexer/*'
+
       - name: Run indexer tests
         run: python3 -m unittest discover -s teraphon-indexer -p 'test_*.py' -v
+
       - name: Install rclone
         run: sudo apt-get update -qq && sudo apt-get install -y rclone
+
       - name: Download first part and manifest
         env:
-          R2_ACCESS_KEY_ID: ${{ secrets.TERAPHON_R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.TERAPHON_R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: https://c2bd2b5948d77f7a413a4ad97279fae4.r2.cloudflarestorage.com
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.TERAPHON_R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.TERAPHON_R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ENDPOINT: https://c2bd2b5948d77f7a413a4ad97279fae4.r2.cloudflarestorage.com
         run: |
           set -euo pipefail
-          test -n "$R2_ACCESS_KEY_ID" && test -n "$R2_SECRET_ACCESS_KEY"
+          test -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID"
+          test -n "$RCLONE_CONFIG_R2_SECRET_ACCESS_KEY"
           mkdir -p input
-          rclone --config /dev/null copyto :s3,provider=Cloudflare,access_key_id=${R2_ACCESS_KEY_ID},secret_access_key=${R2_SECRET_ACCESS_KEY},region=auto,endpoint=${R2_ENDPOINT}:teraphon-music-data/raw/discogs-2026/STATE.json input/STATE.json
-          rclone --config /dev/null copyto :s3,provider=Cloudflare,access_key_id=${R2_ACCESS_KEY_ID},secret_access_key=${R2_SECRET_ACCESS_KEY},region=auto,endpoint=${R2_ENDPOINT}:teraphon-music-data/raw/discogs-2026/part_00001.csv.gz input/part_00001.csv.gz
+          rclone --config /dev/null copyto r2:teraphon-music-data/raw/discogs-2026/STATE.json input/STATE.json
+          rclone --config /dev/null copyto r2:teraphon-music-data/raw/discogs-2026/part_00001.csv.gz input/part_00001.csv.gz
+
       - name: Index 150000 rows
         run: python3 teraphon-indexer/index.py --input-dir input --output-dir output --max-parts 1 --verify-sha256
+
       - uses: actions/upload-artifact@v4
         with:
           name: teraphon-discogs-pilot
